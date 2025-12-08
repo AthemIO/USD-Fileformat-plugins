@@ -32,7 +32,9 @@ governing permissions and limitations under the License.
 #include <pxr/usd/usdSkel/tokens.h>
 #include <pxr/usd/usdVol/tokens.h>
 
+#include <cmath>
 #include <fstream>
+#include <set>
 
 using namespace PXR_NS;
 
@@ -740,7 +742,7 @@ _writeMesh(SdfAbstractData* sdfData,
     return primPath;
 }
 
-void
+SdfPath
 _writePointsOrMesh(WriteSdfContext& ctx,
                    const SdfPath& parentPath,
                    const Mesh& mesh,
@@ -748,10 +750,12 @@ _writePointsOrMesh(WriteSdfContext& ctx,
 {
     if (mesh.asPoints) {
         _writePoints(ctx.sdfData, parentPath, mesh);
+        return SdfPath();
     } else {
         SdfPath meshPath =
           _writeMesh(ctx.sdfData, parentPath, ctx.materialMap, mesh, mesh.name, skeletonPath);
         _bindMeshMaterial(ctx.sdfData, meshPath, ctx.materialMap, mesh);
+        return meshPath;
     }
 }
 
@@ -1018,7 +1022,17 @@ _writeNode(WriteSdfContext& ctx, const SdfPath& primPath, const Node& node)
     for (int meshIndex : node.staticMeshes) {
         const Mesh& mesh = ctx.usdData->meshes[meshIndex];
         if (!mesh.instanceable) {
-            _writePointsOrMesh(ctx, primPath, mesh);
+            SdfPath meshPath = _writePointsOrMesh(ctx, primPath, mesh);
+
+            // Write blend shapes for this mesh if present
+            if (!meshPath.IsEmpty()) {
+                for (const BlendShape& blendShape : ctx.usdData->blendShapes) {
+                    if (blendShape.meshIndex == meshIndex) {
+                        _writeBlendShapesForMesh(ctx.sdfData, meshPath, blendShape);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1180,7 +1194,8 @@ SdfPath
 _writeSkeletonAnimation(SdfAbstractData* sdfData,
                         const SdfPath& parentPath,
                         const Skeleton& skeleton,
-                        const SkeletonAnimation& animation)
+                        const SkeletonAnimation& animation,
+                        const std::vector<const BlendShape*>& blendShapes = {})
 {
     SdfPath primPath =
       createPrimSpec(sdfData, parentPath, _tokens->skelAnim, UsdSkelTokens->SkelAnimation);
@@ -1217,7 +1232,180 @@ _writeSkeletonAnimation(SdfAbstractData* sdfData,
         sdfData->SetTimeSample(scaleAttrPath, time, VtValue(animation.scales[i]));
     }
 
+    // Write blend shape animations if present
+    if (!blendShapes.empty()) {
+        // Collect all blend shape names and build combined weight animation
+        VtTokenArray allBlendShapeNames;
+        size_t totalTargetCount = 0;
+        for (const BlendShape* bs : blendShapes) {
+            for (const BlendShapeTarget& target : bs->targets) {
+                allBlendShapeNames.push_back(TfToken(target.name));
+            }
+            totalTargetCount += bs->targets.size();
+        }
+
+        if (!allBlendShapeNames.empty()) {
+            // Write the blendShapes attribute (list of names)
+            SdfPath blendShapesPath = createAttributeSpec(sdfData,
+                                                          primPath,
+                                                          UsdSkelTokens->blendShapes,
+                                                          SdfValueTypeNames->TokenArray,
+                                                          SdfVariabilityUniform);
+            setAttributeDefaultValue(sdfData, blendShapesPath, allBlendShapeNames);
+
+            // Collect all unique times from all blend shape animations
+            std::set<float> allTimes;
+            for (const BlendShape* bs : blendShapes) {
+                if (!bs->animations.empty() && !bs->animations[0].times.empty()) {
+                    const BlendShapeAnimation& bsAnim = bs->animations[0];
+                    for (float t : bsAnim.times) {
+                        allTimes.insert(t);
+                    }
+                }
+            }
+
+            if (!allTimes.empty()) {
+                // Write time-sampled blendShapeWeights
+                SdfPath weightsPath = createAttributeSpec(sdfData,
+                                                          primPath,
+                                                          UsdSkelTokens->blendShapeWeights,
+                                                          SdfValueTypeNames->FloatArray);
+
+                for (float time : allTimes) {
+                    VtFloatArray combinedWeights;
+                    combinedWeights.reserve(totalTargetCount);
+
+                    for (const BlendShape* bs : blendShapes) {
+                        size_t numTargets = bs->targets.size();
+                        if (!bs->animations.empty() && !bs->animations[0].times.empty()) {
+                            const BlendShapeAnimation& bsAnim = bs->animations[0];
+                            // Find the closest time sample
+                            size_t timeIdx = 0;
+                            for (size_t i = 0; i < bsAnim.times.size(); ++i) {
+                                if (std::abs(bsAnim.times[i] - time) < 0.0001f) {
+                                    timeIdx = i;
+                                    break;
+                                }
+                            }
+                            if (timeIdx < bsAnim.weights.size()) {
+                                for (size_t w = 0; w < numTargets && w < bsAnim.weights[timeIdx].size(); ++w) {
+                                    combinedWeights.push_back(bsAnim.weights[timeIdx][w]);
+                                }
+                                // Pad with zeros if needed
+                                for (size_t w = bsAnim.weights[timeIdx].size(); w < numTargets; ++w) {
+                                    combinedWeights.push_back(0.0f);
+                                }
+                            } else {
+                                // No animation data, use zeros
+                                for (size_t w = 0; w < numTargets; ++w) {
+                                    combinedWeights.push_back(0.0f);
+                                }
+                            }
+                        } else {
+                            // No animation for this blend shape, use zeros
+                            for (size_t w = 0; w < numTargets; ++w) {
+                                combinedWeights.push_back(0.0f);
+                            }
+                        }
+                    }
+
+                    sdfData->SetTimeSample(weightsPath, static_cast<double>(time), VtValue(combinedWeights));
+                }
+
+                TF_DEBUG_MSG(FILE_FORMAT_UTIL,
+                             "layer::write %zu blend shape weight keyframes for %zu blend shapes\n",
+                             allTimes.size(),
+                             allBlendShapeNames.size());
+            }
+        }
+    }
+
     return primPath;
+}
+
+// Write a single UsdSkelBlendShape prim as a child of the mesh
+SdfPath
+_writeBlendShapeTarget(SdfAbstractData* sdfData,
+                       const SdfPath& parentPath,
+                       const BlendShapeTarget& target)
+{
+    SdfPath primPath =
+      createPrimSpec(sdfData, parentPath, TfToken(target.name), UsdSkelTokens->BlendShape);
+
+    TF_DEBUG_MSG(FILE_FORMAT_UTIL,
+                 "layer::write blend shape target '%s' at path %s\n",
+                 target.name.c_str(),
+                 primPath.GetText());
+
+    if (!target.displayName.empty()) {
+        setPrimMetadata(sdfData, primPath, SdfFieldKeys->DisplayName, VtValue(target.displayName));
+    }
+
+    auto createAttr = [&](const TfToken& name,
+                          const SdfValueTypeName& type,
+                          const auto& value,
+                          bool uniform = false) {
+        SdfVariability variability = uniform ? SdfVariabilityUniform : SdfVariabilityVarying;
+        SdfPath p = createAttributeSpec(sdfData, primPath, name, type, variability);
+        setAttributeDefaultValue(sdfData, p, value);
+    };
+
+    // Write offsets (required)
+    createAttr(UsdSkelTokens->offsets, SdfValueTypeNames->Vector3fArray, target.offsets);
+
+    // Write normalOffsets (optional)
+    if (!target.normalOffsets.empty()) {
+        createAttr(UsdSkelTokens->normalOffsets, SdfValueTypeNames->Vector3fArray, target.normalOffsets);
+    }
+
+    // Write pointIndices (optional - for sparse blend shapes)
+    if (!target.pointIndices.empty()) {
+        createAttr(UsdSkelTokens->pointIndices, SdfValueTypeNames->IntArray, target.pointIndices, true);
+    }
+
+    return primPath;
+}
+
+// Write all blend shape targets for a mesh and set up the blendShapeTargets relationship
+void
+_writeBlendShapesForMesh(SdfAbstractData* sdfData,
+                         const SdfPath& meshPath,
+                         const BlendShape& blendShape)
+{
+    if (blendShape.targets.empty()) {
+        return;
+    }
+
+    // Apply SkelBindingAPI to mesh if not already applied (needed for blendShapeTargets relationship)
+    prependApiSchema(sdfData, meshPath, UsdSkelTokens->SkelBindingAPI);
+
+    // Write each blend shape target as a child of the mesh
+    SdfPathVector targetPaths;
+    VtTokenArray blendShapeNames;
+    for (const BlendShapeTarget& target : blendShape.targets) {
+        SdfPath targetPath = _writeBlendShapeTarget(sdfData, meshPath, target);
+        targetPaths.push_back(targetPath);
+        blendShapeNames.push_back(TfToken(target.name));
+    }
+
+    // Create the skel:blendShapeTargets relationship on the mesh
+    SdfPath relPath =
+      createRelationshipSpec(sdfData, meshPath, UsdSkelTokens->skelBlendShapeTargets);
+    for (const SdfPath& targetPath : targetPaths) {
+        prependRelationshipTarget(sdfData, relPath, targetPath);
+    }
+
+    // Write the skel:blendShapes attribute on the mesh (list of blend shape names for animation)
+    SdfPath blendShapesAttrPath = createAttributeSpec(sdfData, meshPath,
+                                                      UsdSkelTokens->skelBlendShapes,
+                                                      SdfValueTypeNames->TokenArray,
+                                                      SdfVariabilityUniform);
+    setAttributeDefaultValue(sdfData, blendShapesAttrPath, blendShapeNames);
+
+    TF_DEBUG_MSG(FILE_FORMAT_UTIL,
+                 "layer::write %zu blend shape targets for mesh %s\n",
+                 blendShape.targets.size(),
+                 meshPath.GetText());
 }
 
 SdfPath
@@ -1520,7 +1708,17 @@ _writeLayerSdfData(const WriteLayerOptions& options,
                 const Mesh& mesh = ctx.usdData->meshes[meshIndex];
 
                 // Note, skinned meshes are never emitted as instanced
-                _writePointsOrMesh(ctx, skelRootPath, mesh, skeletonPath);
+                SdfPath meshPath = _writePointsOrMesh(ctx, skelRootPath, mesh, skeletonPath);
+
+                // Write blend shapes for this mesh if present
+                if (!meshPath.IsEmpty()) {
+                    for (const BlendShape& blendShape : ctx.usdData->blendShapes) {
+                        if (blendShape.meshIndex == meshIndex) {
+                            _writeBlendShapesForMesh(sdfData, meshPath, blendShape);
+                            break;
+                        }
+                    }
+                }
 
                 meshChildIndex++;
             }
@@ -1529,8 +1727,20 @@ _writeLayerSdfData(const WriteLayerOptions& options,
                 // At this point in time, all skeletonAnimations have been joined into the first
                 // animation track so there is only one animation to deal with here.
                 const SkeletonAnimation& skeletonAnimation = skeleton.skeletonAnimations.front();
+
+                // Collect blend shapes for meshes associated with this skeleton
+                std::vector<const BlendShape*> skeletonBlendShapes;
+                for (int meshIndex : skeleton.meshSkinningTargets) {
+                    for (const BlendShape& blendShape : ctx.usdData->blendShapes) {
+                        if (blendShape.meshIndex == meshIndex) {
+                            skeletonBlendShapes.push_back(&blendShape);
+                            break;
+                        }
+                    }
+                }
+
                 SdfPath skeletonAnimationPath =
-                  _writeSkeletonAnimation(sdfData, skeletonPath, skeleton, skeletonAnimation);
+                  _writeSkeletonAnimation(sdfData, skeletonPath, skeleton, skeletonAnimation, skeletonBlendShapes);
             }
         }
     }

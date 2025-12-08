@@ -38,6 +38,7 @@ governing permissions and limitations under the License.
 #include <pxr/usd/usdShade/materialBindingAPI.h>
 #include <pxr/usd/usdSkel/animation.h>
 #include <pxr/usd/usdSkel/bindingAPI.h>
+#include <pxr/usd/usdSkel/blendShape.h>
 #include <pxr/usd/usdSkel/cache.h>
 #include <pxr/usd/usdSkel/root.h>
 #include <pxr/usd/usdSkel/skeleton.h>
@@ -787,6 +788,40 @@ readSkelRoot(ReadLayerContext& ctx, const UsdPrim& prim, int parent)
                 printMesh("layer::read", mesh, ctx.debugTag);
                 skeleton.meshSkinningTargets[i] = meshIndex;
 
+                // Read blend shapes for this mesh
+                UsdSkelBindingAPI meshBindingAPI(meshPrim);
+                SdfPathVector blendShapeTargetPaths;
+                UsdRelationship blendShapeTargetsRel = meshBindingAPI.GetBlendShapeTargetsRel();
+                if (blendShapeTargetsRel && blendShapeTargetsRel.GetTargets(&blendShapeTargetPaths) &&
+                    !blendShapeTargetPaths.empty()) {
+                    auto [blendShapeIndex, blendShape] = ctx.usd->addBlendShape();
+                    blendShape.meshIndex = meshIndex;
+
+                    for (const SdfPath& targetPath : blendShapeTargetPaths) {
+                        UsdPrim blendShapePrim = meshPrim.GetStage()->GetPrimAtPath(targetPath);
+                        if (!blendShapePrim || !blendShapePrim.IsA<UsdSkelBlendShape>()) {
+                            continue;
+                        }
+
+                        UsdSkelBlendShape blendShapeSchema(blendShapePrim);
+                        BlendShapeTarget target;
+                        target.name = blendShapePrim.GetName().GetString();
+                        target.displayName = blendShapePrim.GetDisplayName();
+
+                        blendShapeSchema.GetOffsetsAttr().Get(&target.offsets);
+                        blendShapeSchema.GetNormalOffsetsAttr().Get(&target.normalOffsets);
+                        blendShapeSchema.GetPointIndicesAttr().Get(&target.pointIndices);
+
+                        blendShape.targets.push_back(std::move(target));
+
+                        TF_DEBUG_MSG(FILE_FORMAT_UTIL,
+                                     "%s: layer::read blend shape '%s' with %zu offsets\n",
+                                     ctx.debugTag.c_str(),
+                                     target.name.c_str(),
+                                     target.offsets.size());
+                    }
+                }
+
                 // Add skeleton/mesh to the node.skinnedMeshes vector as well.
                 // This is redundant info with skeleton.meshSkinningTargets & skeleton.parent
                 // but it helps the exporters to be able to have this info present on the node.
@@ -863,6 +898,46 @@ readSkelRoot(ReadLayerContext& ctx, const UsdPrim& prim, int parent)
                             animation.translations[i].push_back(translation);
                             animation.rotations[i].push_back(rotation);
                             animation.scales[i].push_back(scale);
+                        }
+                    }
+                }
+
+                // Read blend shape weight animations
+                UsdSkelAnimation skelAnim = skelAnimQuery.GetPrim();
+                if (skelAnim) {
+                    VtTokenArray blendShapeNames;
+                    skelAnim.GetBlendShapesAttr().Get(&blendShapeNames);
+
+                    if (!blendShapeNames.empty()) {
+                        UsdAttribute weightsAttr = skelAnim.GetBlendShapeWeightsAttr();
+                        std::vector<double> weightTimes;
+                        weightsAttr.GetTimeSamples(&weightTimes);
+
+                        if (!weightTimes.empty()) {
+                            // Find blend shapes associated with this skeleton's meshes
+                            for (int meshIdx : skeleton.meshSkinningTargets) {
+                                for (BlendShape& blendShape : ctx.usd->blendShapes) {
+                                    if (blendShape.meshIndex == meshIdx) {
+                                        blendShape.animations.resize(1);
+                                        BlendShapeAnimation& bsAnim = blendShape.animations[0];
+                                        bsAnim.times.resize(weightTimes.size());
+                                        bsAnim.weights.resize(weightTimes.size());
+
+                                        for (size_t t = 0; t < weightTimes.size(); ++t) {
+                                            bsAnim.times[t] = static_cast<float>(weightTimes[t]);
+                                            VtFloatArray weights;
+                                            weightsAttr.Get(&weights, weightTimes[t]);
+                                            bsAnim.weights[t] = weights;
+                                        }
+
+                                        TF_DEBUG_MSG(FILE_FORMAT_UTIL,
+                                                     "%s: layer::read %zu blend shape weight keyframes\n",
+                                                     ctx.debugTag.c_str(),
+                                                     weightTimes.size());
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }

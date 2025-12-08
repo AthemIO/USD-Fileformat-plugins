@@ -1588,6 +1588,95 @@ getIndices(const tinygltf::Model& model,
     }
 }
 
+// Import morph targets (blend shapes) from a glTF primitive
+void
+importMeshBlendShapes(ImportGltfContext& ctx,
+                      const tinygltf::Mesh& gmesh,
+                      const tinygltf::Primitive& primitive,
+                      int meshIndex)
+{
+    // Check if primitive has morph targets
+    if (primitive.targets.empty()) {
+        return;
+    }
+
+    // Get target names from mesh.extras.targetNames or primitive.extras.targetNames
+    std::vector<std::string> targetNames;
+
+    // Check mesh-level extras first (preferred location per glTF spec)
+    if (gmesh.extras.Has("targetNames")) {
+        const tinygltf::Value& namesVal = gmesh.extras.Get("targetNames");
+        if (namesVal.IsArray()) {
+            for (size_t i = 0; i < namesVal.ArrayLen(); ++i) {
+                const tinygltf::Value& nameVal = namesVal.Get(static_cast<int>(i));
+                if (nameVal.IsString()) {
+                    targetNames.push_back(nameVal.Get<std::string>());
+                }
+            }
+        }
+    }
+
+    // Fallback to primitive-level extras if no names found at mesh level
+    if (targetNames.empty() && primitive.extras.Has("targetNames")) {
+        const tinygltf::Value& namesVal = primitive.extras.Get("targetNames");
+        if (namesVal.IsArray()) {
+            for (size_t i = 0; i < namesVal.ArrayLen(); ++i) {
+                const tinygltf::Value& nameVal = namesVal.Get(static_cast<int>(i));
+                if (nameVal.IsString()) {
+                    targetNames.push_back(nameVal.Get<std::string>());
+                }
+            }
+        }
+    }
+
+    // Create BlendShape for this mesh
+    auto [blendShapeIndex, blendShape] = ctx.usd->addBlendShape();
+    blendShape.meshIndex = meshIndex;
+    blendShape.targets.resize(primitive.targets.size());
+
+    for (size_t targetIdx = 0; targetIdx < primitive.targets.size(); ++targetIdx) {
+        const auto& target = primitive.targets[targetIdx];
+        BlendShapeTarget& bsTarget = blendShape.targets[targetIdx];
+
+        // Set name from targetNames or generate default
+        if (targetIdx < targetNames.size() && !targetNames[targetIdx].empty()) {
+            bsTarget.displayName = targetNames[targetIdx];
+            bsTarget.name = PXR_NS::TfMakeValidIdentifier(targetNames[targetIdx]);
+        } else {
+            bsTarget.name = "target_" + std::to_string(targetIdx);
+            bsTarget.displayName = bsTarget.name;
+        }
+
+        // Read POSITION deltas (required for morph targets)
+        auto posIt = target.find("POSITION");
+        if (posIt != target.end()) {
+            int posAccessor = posIt->second;
+            size_t count = getAccessorElementCount(*ctx.gltf, posAccessor);
+            bsTarget.offsets.resize(count);
+            readAccessorDataToFloat(*ctx.gltf, posAccessor,
+                                    reinterpret_cast<float*>(bsTarget.offsets.data()));
+        }
+
+        // Read NORMAL deltas (optional)
+        auto normIt = target.find("NORMAL");
+        if (normIt != target.end()) {
+            int normAccessor = normIt->second;
+            size_t count = getAccessorElementCount(*ctx.gltf, normAccessor);
+            bsTarget.normalOffsets.resize(count);
+            readAccessorDataToFloat(*ctx.gltf, normAccessor,
+                                    reinterpret_cast<float*>(bsTarget.normalOffsets.data()));
+        }
+
+        // Note: glTF morph targets are dense (not sparse), so pointIndices remains empty
+        // USD will apply offsets 1:1 to mesh points
+    }
+
+    TF_DEBUG_MSG(FILE_FORMAT_GLTF,
+                 "gltf::import %zu blend shape targets for mesh %d\n",
+                 blendShape.targets.size(),
+                 meshIndex);
+}
+
 void
 importMeshes(ImportGltfContext& ctx)
 {
@@ -1826,6 +1915,9 @@ importMeshes(ImportGltfContext& ctx)
                             primitive.material);
                 }
             }
+
+            // Import blend shapes (morph targets) for this primitive
+            importMeshBlendShapes(ctx, gmesh, primitive, meshIndex);
         }
     }
 }
@@ -2119,7 +2211,77 @@ importNodeAnimations(ImportGltfContext& ctx)
                                               track.minTime,
                                               track.maxTime);
             if (channel.target_path == "weights") {
-                TF_WARN("Unsupported import of GLTF blend weight animation");
+                // Import blend shape weight animation
+                int gltfNodeIndex = channel.target_node;
+                if (gltfNodeIndex >= 0 && gltfNodeIndex < static_cast<int>(ctx.gltf->nodes.size())) {
+                    const tinygltf::Node& targetNode = ctx.gltf->nodes[gltfNodeIndex];
+                    if (targetNode.mesh >= 0 && targetNode.mesh < static_cast<int>(ctx.gltf->meshes.size())) {
+                        // Find the USD mesh indices for this glTF mesh
+                        const auto& primitiveMeshIndices = ctx.meshes[targetNode.mesh];
+
+                        // Import weight animation for each primitive's blend shape
+                        for (int usdMeshIndex : primitiveMeshIndices) {
+                            // Find the BlendShape for this mesh
+                            for (BlendShape& blendShape : ctx.usd->blendShapes) {
+                                if (blendShape.meshIndex == usdMeshIndex) {
+                                    // Validate sampler accessors
+                                    if (sampler.input < 0 || sampler.output < 0 ||
+                                        sampler.input >= static_cast<int>(ctx.gltf->accessors.size()) ||
+                                        sampler.output >= static_cast<int>(ctx.gltf->accessors.size())) {
+                                        TF_WARN("Invalid weight animation sampler accessors");
+                                        break;
+                                    }
+
+                                    // Read time values
+                                    size_t timeCount = getAccessorElementCount(*ctx.gltf, sampler.input);
+                                    std::vector<float> times(timeCount);
+                                    readAccessorDataToFloat(*ctx.gltf, sampler.input, times.data());
+
+                                    // Read weight values (interleaved)
+                                    size_t weightsCount = getAccessorElementCount(*ctx.gltf, sampler.output);
+                                    std::vector<float> allWeights(weightsCount);
+                                    readAccessorDataToFloat(*ctx.gltf, sampler.output, allWeights.data());
+
+                                    size_t targetCount = blendShape.targets.size();
+                                    if (targetCount > 0 && weightsCount == timeCount * targetCount) {
+                                        // Ensure animation array is sized for this track
+                                        if (blendShape.animations.size() <= animationTrackIndex) {
+                                            blendShape.animations.resize(animationTrackIndex + 1);
+                                        }
+
+                                        BlendShapeAnimation& bsAnim = blendShape.animations[animationTrackIndex];
+                                        bsAnim.times.resize(timeCount);
+                                        bsAnim.weights.resize(timeCount);
+
+                                        float timeScale = ctx.usd->timeCodesPerSecond;
+                                        for (size_t t = 0; t < timeCount; ++t) {
+                                            bsAnim.times[t] = times[t] * timeScale;
+                                            bsAnim.weights[t].resize(targetCount);
+                                            for (size_t w = 0; w < targetCount; ++w) {
+                                                bsAnim.weights[t][w] = allWeights[t * targetCount + w];
+                                            }
+
+                                            // Update min/max time
+                                            track.minTime = std::min(track.minTime, bsAnim.times[t]);
+                                            track.maxTime = std::max(track.maxTime, bsAnim.times[t]);
+                                        }
+
+                                        track.hasTimepoints = true;
+                                        ctx.usd->hasAnimations = true;
+
+                                        TF_DEBUG_MSG(FILE_FORMAT_GLTF,
+                                                     "gltf::import %zu weight animation keyframes for mesh %d\n",
+                                                     timeCount, usdMeshIndex);
+                                    } else {
+                                        TF_WARN("Weight animation size mismatch: %zu weights for %zu targets over %zu frames",
+                                                weightsCount, targetCount, timeCount);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if (hasNodeAnimation) {

@@ -2251,6 +2251,107 @@ exportMeshes(ExportGltfContext& ctx)
 }
 
 bool
+exportBlendShapes(ExportGltfContext& ctx)
+{
+    if (ctx.usd->blendShapes.empty()) {
+        return true;
+    }
+
+    for (const BlendShape& blendShape : ctx.usd->blendShapes) {
+        if (blendShape.targets.empty() || blendShape.meshIndex < 0 ||
+            blendShape.meshIndex >= static_cast<int>(ctx.primitiveMap.size())) {
+            continue;
+        }
+
+        std::vector<tinygltf::Primitive>& primitives = ctx.primitiveMap[blendShape.meshIndex];
+        if (primitives.empty()) {
+            continue;
+        }
+
+        // Build target names for mesh.extras.targetNames
+        std::vector<tinygltf::Value> targetNames;
+        for (const BlendShapeTarget& target : blendShape.targets) {
+            std::string name = target.displayName.empty() ? target.name : target.displayName;
+            targetNames.push_back(tinygltf::Value(name));
+        }
+
+        // Add morph targets to each primitive
+        for (tinygltf::Primitive& primitive : primitives) {
+            primitive.targets.resize(blendShape.targets.size());
+
+            for (size_t targetIdx = 0; targetIdx < blendShape.targets.size(); ++targetIdx) {
+                const BlendShapeTarget& target = blendShape.targets[targetIdx];
+                std::map<std::string, int>& gltfTarget = primitive.targets[targetIdx];
+
+                // Export position offsets
+                if (!target.offsets.empty()) {
+                    // For sparse blend shapes, expand to dense if needed
+                    PXR_NS::VtVec3fArray denseOffsets;
+                    if (!target.pointIndices.empty()) {
+                        const Mesh& mesh = ctx.usd->meshes[blendShape.meshIndex];
+                        denseOffsets.resize(mesh.points.size(), PXR_NS::GfVec3f(0));
+                        for (size_t j = 0; j < target.pointIndices.size() && j < target.offsets.size(); ++j) {
+                            int idx = target.pointIndices[j];
+                            if (idx >= 0 && idx < static_cast<int>(denseOffsets.size())) {
+                                denseOffsets[idx] = target.offsets[j];
+                            }
+                        }
+                    } else {
+                        denseOffsets = target.offsets;
+                    }
+
+                    int posAccessor = addAccessor(ctx.gltf,
+                                                  "blendshape_position_" + std::to_string(targetIdx),
+                                                  0, // No buffer target for morph data
+                                                  TINYGLTF_TYPE_VEC3,
+                                                  TINYGLTF_COMPONENT_TYPE_FLOAT,
+                                                  denseOffsets.size(),
+                                                  denseOffsets.data(),
+                                                  true);
+                    gltfTarget["POSITION"] = posAccessor;
+                }
+
+                // Export normal offsets
+                if (!target.normalOffsets.empty()) {
+                    PXR_NS::VtVec3fArray denseNormals;
+                    if (!target.pointIndices.empty()) {
+                        const Mesh& mesh = ctx.usd->meshes[blendShape.meshIndex];
+                        denseNormals.resize(mesh.points.size(), PXR_NS::GfVec3f(0));
+                        for (size_t j = 0; j < target.pointIndices.size() && j < target.normalOffsets.size(); ++j) {
+                            int idx = target.pointIndices[j];
+                            if (idx >= 0 && idx < static_cast<int>(denseNormals.size())) {
+                                denseNormals[idx] = target.normalOffsets[j];
+                            }
+                        }
+                    } else {
+                        denseNormals = target.normalOffsets;
+                    }
+
+                    int normAccessor = addAccessor(ctx.gltf,
+                                                   "blendshape_normal_" + std::to_string(targetIdx),
+                                                   0,
+                                                   TINYGLTF_TYPE_VEC3,
+                                                   TINYGLTF_COMPONENT_TYPE_FLOAT,
+                                                   denseNormals.size(),
+                                                   denseNormals.data(),
+                                                   false);
+                    gltfTarget["NORMAL"] = normAccessor;
+                }
+            }
+        }
+
+        // Store target names - will be added to mesh extras when mesh is finalized
+        // For now, we need to track this mapping to add names later
+        TF_DEBUG_MSG(FILE_FORMAT_GLTF,
+                     "gltf::export %zu morph targets for mesh %d\n",
+                     blendShape.targets.size(),
+                     blendShape.meshIndex);
+    }
+
+    return true;
+}
+
+bool
 exportGltf(const ExportGltfOptions& options, UsdData& usd, tinygltf::Model& gltf)
 {
     ExportGltfContext ctx;
@@ -2262,6 +2363,7 @@ exportGltf(const ExportGltfOptions& options, UsdData& usd, tinygltf::Model& gltf
     exportMetadata(ctx);
     exportMaterials(ctx);
     exportMeshes(ctx);
+    exportBlendShapes(ctx);
     exportLights(ctx);
 
     int offsetNode = -1;

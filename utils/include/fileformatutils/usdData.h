@@ -269,6 +269,47 @@ struct USDFFUTILS_API Skeleton
     PXR_NS::VtTokenArray animatedJoints; // could be a subset of joints
 };
 
+/// \ingroup utils_blendshapes
+/// \brief A single blend shape target (morph target)
+struct USDFFUTILS_API BlendShapeTarget
+{
+    std::string name;
+    std::string displayName;
+
+    // Position offsets (deltas from base mesh)
+    PXR_NS::VtVec3fArray offsets;
+
+    // Normal offsets (optional, deltas from base mesh normals)
+    PXR_NS::VtVec3fArray normalOffsets;
+
+    // Point indices - if sparse, maps offset index to mesh point index
+    // If empty, offsets apply 1:1 to mesh points (dense)
+    PXR_NS::VtIntArray pointIndices;
+};
+
+/// \ingroup utils_blendshapes
+/// \brief Blend shape animation data (weights over time)
+struct USDFFUTILS_API BlendShapeAnimation
+{
+    std::vector<float> times;
+    // weights[timeIndex] contains weights for all blend shapes at that time
+    std::vector<PXR_NS::VtFloatArray> weights;
+};
+
+/// \ingroup utils_blendshapes
+/// \brief Collection of blend shapes for a mesh
+struct USDFFUTILS_API BlendShape
+{
+    // Index of the mesh these blend shapes target
+    int meshIndex = -1;
+
+    // The blend shape targets (one per morph target)
+    std::vector<BlendShapeTarget> targets;
+
+    // Animation data for blend shape weights
+    std::vector<BlendShapeAnimation> animations;
+};
+
 /// \ingroup utils_layer
 struct USDFFUTILS_API AnimationTrack
 {
@@ -456,6 +497,7 @@ struct USDFFUTILS_API UsdData
     std::vector<Material> materials;
     std::vector<Skeleton> skeletons;
     std::vector<NgpData> ngps;
+    std::vector<BlendShape> blendShapes;
 
     std::pair<int, Node&> addNode(int parent);
     std::pair<int, Node&> getParent(int parent);
@@ -473,6 +515,7 @@ struct USDFFUTILS_API UsdData
     std::pair<int, Camera&> addCamera();
     std::pair<int, Skeleton&> addSkeleton();
     std::pair<int, NgpData&> addNgp();
+    std::pair<int, BlendShape&> addBlendShape();
 };
 
 // Returns true if the Input has a constant value of supported type

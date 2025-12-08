@@ -468,6 +468,14 @@ UsdData::addNgp()
     return { index, ngps[index] };
 }
 
+std::pair<int, BlendShape&>
+UsdData::addBlendShape()
+{
+    int index = blendShapes.size();
+    blendShapes.push_back(BlendShape());
+    return { index, blendShapes[index] };
+}
+
 std::string
 _makeValidPrimName(const std::string& name, const std::string& defaultName)
 {
