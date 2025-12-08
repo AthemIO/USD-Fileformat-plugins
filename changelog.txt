@@ -1,3 +1,13 @@
+v1.2.1  December 7th, 2025
+gltf:
+    - add blend shape (morph target) support for import and export
+    - import morph target names from mesh.extras.targetNames (ARKit naming)
+    - import/export position and normal deltas for blend shapes
+    - import/export blend shape weight animations
+    - write UsdSkelBlendShape prims with skel:blendShapeTargets relationship
+    - write time-sampled blendShapeWeights to SkelAnimation
+    - read blend shapes from USD via UsdSkelBindingAPI for export
+
 v1.2.0  October 22nd, 2025
 fbx:
     - fix mesh import when fbx mesh is a root node
